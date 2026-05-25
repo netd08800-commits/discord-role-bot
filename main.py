@@ -32,34 +32,39 @@ ROLE_OPTIONS = {
         "emoji": "👤",
         "label": "Гражданский",
         "role_id": int(get_required_env("ROLE_CIVILIAN")),
+        "auto_give": True,
     },
     "state": {
         "emoji": "🛡️",
         "label": "Сотрудник гос. структуры",
         "role_id": int(get_required_env("ROLE_STATE")),
+        "auto_give": False,
     },
     "government": {
         "emoji": "🏛️",
         "label": "Сотрудник Правительства",
         "role_id": int(get_required_env("ROLE_GOVERNMENT")),
+        "auto_give": False,
     },
     "prosecutor": {
         "emoji": "⚖️",
         "label": "Сотрудник Прокуратуры",
         "role_id": int(get_required_env("ROLE_PROSECUTOR")),
+        "auto_give": False,
     },
     "health_minister": {
         "emoji": "🧑‍⚕️",
         "label": "Министр Здравоохранения",
         "role_id": int(get_required_env("ROLE_HEALTH_MINISTER")),
+        "auto_give": False,
     },
 }
 
 BUTTON_COOLDOWN = timedelta(minutes=30)
 
-# Кулдаун хранится в памяти.
-# Если бот полностью перезапустится, кулдаун сбросится.
-user_cooldowns: dict[int, datetime] = {}
+# Кулдаун только на создание заявок.
+# Гражданский выдаётся автоматом и не блокирует запрос доп. роли.
+user_ticket_cooldowns: dict[int, datetime] = {}
 
 
 def sanitize_channel_name(text: str) -> str:
@@ -170,13 +175,13 @@ async def set_ticket_status(
 
 def create_ticket_embed(
     member: discord.Member,
-    role_data: dict[str, str | int]
+    role_data: dict[str, str | int | bool]
 ) -> discord.Embed:
     embed = discord.Embed(
-        title="📋 Заявка на получение роли",
+        title="📋 Заявка на получение дополнительной роли",
         description=(
             f"{member.mention}, ваш запрос был успешно создан.\n"
-            "Заполните форму ниже и ожидайте ответа модерации."
+            "Заполните форму ниже, чтобы модерация могла рассмотреть заявку."
         ),
         color=discord.Color.blurple()
     )
@@ -232,6 +237,98 @@ def create_ticket_embed(
     )
 
     return embed
+
+
+def create_auto_role_embed(
+    member: discord.Member,
+    role_data: dict[str, str | int | bool]
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="✅ Роль успешно выдана",
+        description=(
+            f"{member.mention}, вам автоматически выдана роль:\n\n"
+            f"**{role_data['emoji']} {role_data['label']}**"
+        ),
+        color=discord.Color.green()
+    )
+
+    embed.set_footer(
+        text="Если нужна дополнительная роль — нажмите соответствующую кнопку."
+    )
+
+    return embed
+
+
+async def give_auto_role(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    role_data: dict[str, str | int | bool]
+):
+    guild = interaction.guild
+
+    if guild is None:
+        await interaction.response.send_message(
+            "Эта кнопка работает только на сервере.",
+            ephemeral=True
+        )
+        return
+
+    role = guild.get_role(int(role_data["role_id"]))
+
+    if role is None:
+        await interaction.response.send_message(
+            "Роль не найдена. Проверь ID роли в Railway Variables.",
+            ephemeral=True
+        )
+        return
+
+    if role in member.roles:
+        await interaction.response.send_message(
+            f"У вас уже есть роль **{role_data['emoji']} {role_data['label']}**.",
+            ephemeral=True
+        )
+        return
+
+    bot_member = guild.me
+
+    if bot_member is None:
+        await interaction.response.send_message(
+            "Не удалось проверить права бота.",
+            ephemeral=True
+        )
+        return
+
+    if role >= bot_member.top_role:
+        await interaction.response.send_message(
+            "Я не могу выдать эту роль. Подними роль бота выше выдаваемых ролей.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await member.add_roles(
+            role,
+            reason="Автоматическая выдача роли Гражданский"
+        )
+
+        embed = create_auto_role_embed(member, role_data)
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Я не смог выдать роль. Проверь права и порядок ролей.",
+            ephemeral=True
+        )
+
+    except discord.HTTPException:
+        await interaction.response.send_message(
+            "Discord не дал выдать роль. Попробуйте позже.",
+            ephemeral=True
+        )
 
 
 async def handle_ticket_action(
@@ -451,8 +548,18 @@ class RoleRequestButton(discord.ui.Button):
             )
             return
 
+        role_data = ROLE_OPTIONS[self.role_key]
+
+        if role_data.get("auto_give") is True:
+            await give_auto_role(
+                interaction=interaction,
+                member=member,
+                role_data=role_data
+            )
+            return
+
         now = datetime.now(timezone.utc)
-        last_click = user_cooldowns.get(member.id)
+        last_click = user_ticket_cooldowns.get(member.id)
 
         if last_click is not None:
             remaining = BUTTON_COOLDOWN - (now - last_click)
@@ -462,7 +569,7 @@ class RoleRequestButton(discord.ui.Button):
                 seconds = int(remaining.total_seconds() % 60)
 
                 await interaction.response.send_message(
-                    f"Кнопки можно нажимать 1 раз в 30 минут. "
+                    f"Заявки можно создавать 1 раз в 30 минут. "
                     f"Попробуйте снова через {minutes} мин. {seconds} сек.",
                     ephemeral=True
                 )
@@ -477,7 +584,6 @@ class RoleRequestButton(discord.ui.Button):
             )
             return
 
-        role_data = ROLE_OPTIONS[self.role_key]
         moder_role = guild.get_role(MOD_ROLE_ID)
 
         if moder_role is None:
@@ -562,7 +668,7 @@ class RoleRequestButton(discord.ui.Button):
                 )
             )
 
-            user_cooldowns[member.id] = now
+            user_ticket_cooldowns[member.id] = now
 
             await interaction.followup.send(
                 f"Ваш приватный канал заявки создан: {ticket_channel.mention}",
@@ -681,19 +787,20 @@ async def on_ready():
 
 @bot.tree.command(
     name="setup_roles",
-    description="Отправить сообщение с кнопками запроса роли"
+    description="Отправить сообщение с кнопками выбора/запроса роли"
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_roles(interaction: discord.Interaction):
     message_text = (
         "Приветствую! Я - Бот данного дискорд-сервера, помогаю каждому участнику "
-        "в получении необходимой роли. Нажми соответствующую кнопку с эмоджи ниже, "
-        "роль которой вам нужна.\n\n"
-        "👤 — Гражданский\n"
-        "🛡️ — Сотрудник гос. структуры\n"
-        "🏛️ — Сотрудник Правительства\n"
-        "⚖️ — Сотрудник Прокуратуры\n"
-        "🧑‍⚕️ — Министр Здравоохранения"
+        "в получении необходимой роли.\n\n"
+        "Нажмите соответствующую кнопку с эмоджи ниже:\n\n"
+        "👤 — Гражданский **выдаётся автоматически**\n"
+        "🛡️ — Сотрудник гос. структуры **через заявку**\n"
+        "🏛️ — Сотрудник Правительства **через заявку**\n"
+        "⚖️ — Сотрудник Прокуратуры **через заявку**\n"
+        "🧑‍⚕️ — Министр Здравоохранения **через заявку**\n\n"
+        "Дополнительные роли рассматриваются модерацией."
     )
 
     await interaction.channel.send(
